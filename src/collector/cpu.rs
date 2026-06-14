@@ -6,6 +6,8 @@ use crate::platform::linux::syscall;
 
 pub struct CpuCollector {
     prev_stats: Option<Vec<CpuRawStat>>,
+    #[cfg(target_os = "linux")]
+    persistent_fd: Option<syscall::PersistentFd>,
 }
 
 #[derive(Clone)]
@@ -22,7 +24,11 @@ struct CpuRawStat {
 
 impl CpuCollector {
     pub fn new() -> Self {
-        Self { prev_stats: None }
+        Self {
+            prev_stats: None,
+            #[cfg(target_os = "linux")]
+            persistent_fd: syscall::PersistentFd::open(b"/proc/stat\0"),
+        }
     }
 
     pub fn collect(&mut self) -> Result<CpuMetrics, CollectorError> {
@@ -38,7 +44,11 @@ impl CpuCollector {
     #[cfg(target_os = "linux")]
     fn read_stat(&self) -> Result<Vec<CpuRawStat>, CollectorError> {
         let mut buf = [0u8; 8192];
-        let n = syscall::read_file_to_buf(b"/proc/stat\0", &mut buf);
+        let n = if let Some(pfd) = &self.persistent_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/stat\0", &mut buf)
+        };
         if n <= 0 {
             return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-n as i32)));
         }

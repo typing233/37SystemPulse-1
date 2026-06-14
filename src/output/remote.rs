@@ -119,8 +119,9 @@ impl OutputBackend for HttpBackend {
     fn name(&self) -> &'static str { "http" }
 }
 
-/// gRPC output backend - sends metrics using gRPC wire format
-/// (HTTP/2-like framing: 1-byte compressed flag + 4-byte length + binary payload).
+/// gRPC output backend - sends OTLP metrics via standard gRPC protocol.
+/// Implements HTTP/2 connection preface, SETTINGS, HEADERS (HPACK), DATA frames
+/// with protobuf-encoded ExportMetricsServiceRequest.
 /// Endpoint configurable via SYSPULSE_GRPC_ENDPOINT env var.
 pub struct GrpcBackend {
     endpoint: String,
@@ -133,91 +134,320 @@ impl GrpcBackend {
         Self { endpoint }
     }
 
-    /// Encode metrics into a simple binary wire format:
-    /// For each metric point: [name_len:u16][name][tag_count:u16][tags...][value_type:u8][value][timestamp:u64]
-    fn encode_binary(&self, snapshot: &SystemSnapshot) -> Vec<u8> {
+    /// Encode metrics into protobuf ExportMetricsServiceRequest
+    fn encode_otlp_protobuf(&self, snapshot: &SystemSnapshot) -> Vec<u8> {
         let points = snapshot.to_metric_points();
-        let mut buf = Vec::with_capacity(points.len() * 128);
+        let mut buf = Vec::with_capacity(points.len() * 64);
 
-        // Message header: version(1) + point_count(4)
-        buf.push(1); // version
-        buf.extend_from_slice(&(points.len() as u32).to_be_bytes());
+        // ExportMetricsServiceRequest { resource_metrics: [ResourceMetrics] }
+        // Field 1: resource_metrics (repeated, wire type 2 = LEN)
 
-        for point in &points {
-            // name
-            let name_bytes = point.name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-            buf.extend_from_slice(name_bytes);
+        // Build inner ResourceMetrics message first
+        let mut rm_buf = Vec::with_capacity(points.len() * 64);
 
-            // tags
-            buf.extend_from_slice(&(point.tags.len() as u16).to_be_bytes());
-            for (k, v) in &point.tags {
-                let kb = k.as_bytes();
-                let vb = v.as_bytes();
-                buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
-                buf.extend_from_slice(kb);
-                buf.extend_from_slice(&(vb.len() as u16).to_be_bytes());
-                buf.extend_from_slice(vb);
-            }
+        // ResourceMetrics.resource (field 1, wire type 2)
+        let resource_bytes = self.encode_resource(&snapshot.hostname);
+        proto_field(&mut rm_buf, 1, &resource_bytes);
 
-            // value
-            match &point.value {
-                MetricValue::Gauge(v) => {
-                    buf.push(0x01); // gauge type
-                    buf.extend_from_slice(&v.to_be_bytes());
-                }
-                MetricValue::Counter(v) => {
-                    buf.push(0x02); // counter type
-                    buf.extend_from_slice(&v.to_be_bytes());
-                }
-                MetricValue::Histogram(h) => {
-                    buf.push(0x03); // histogram type
-                    buf.extend_from_slice(&h.count.to_be_bytes());
-                    buf.extend_from_slice(&h.sum.to_be_bytes());
-                    buf.extend_from_slice(&(h.quantiles.len() as u16).to_be_bytes());
-                    for (q, v) in &h.quantiles {
-                        buf.extend_from_slice(&q.to_be_bytes());
-                        buf.extend_from_slice(&v.to_be_bytes());
-                    }
-                }
-            }
+        // ResourceMetrics.scope_metrics (field 2, wire type 2)
+        let scope_metrics = self.encode_scope_metrics(&points);
+        proto_field(&mut rm_buf, 2, &scope_metrics);
 
-            // timestamp
-            buf.extend_from_slice(&point.timestamp.as_nanos().to_be_bytes());
+        // Wrap in ExportMetricsServiceRequest field 1
+        proto_field(&mut buf, 1, &rm_buf);
+        buf
+    }
 
-            // unit
-            let unit_bytes = point.unit.as_bytes();
-            buf.extend_from_slice(&(unit_bytes.len() as u8).to_be_bytes());
-            buf.extend_from_slice(unit_bytes);
+    fn encode_resource(&self, hostname: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Resource.attributes (field 1, repeated KeyValue)
+        let kv = self.encode_key_value("host.name", hostname);
+        proto_field(&mut buf, 1, &kv);
+        buf
+    }
+
+    fn encode_key_value(&self, key: &str, value: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // KeyValue.key (field 1, string)
+        proto_string(&mut buf, 1, key);
+        // KeyValue.value (field 2, AnyValue)
+        let mut av = Vec::new();
+        // AnyValue.string_value (field 1)
+        proto_string(&mut av, 1, value);
+        proto_field(&mut buf, 2, &av);
+        buf
+    }
+
+    fn encode_scope_metrics(&self, points: &[crate::metrics::MetricPoint]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // ScopeMetrics.scope (field 1)
+        let mut scope = Vec::new();
+        proto_string(&mut scope, 1, "syspulse"); // InstrumentationScope.name
+        proto_field(&mut buf, 1, &scope);
+
+        // ScopeMetrics.metrics (field 2, repeated)
+        for point in points {
+            let metric = self.encode_metric(point);
+            proto_field(&mut buf, 2, &metric);
         }
         buf
     }
 
-    /// Send using gRPC wire format: [compressed:u8][length:u32be][payload]
+    fn encode_metric(&self, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Metric.name (field 1)
+        proto_string(&mut buf, 1, &point.name);
+        // Metric.unit (field 3)
+        proto_string(&mut buf, 3, point.unit);
+
+        match &point.value {
+            MetricValue::Gauge(v) => {
+                // Metric.gauge (field 5)
+                let gauge = self.encode_gauge(*v, point);
+                proto_field(&mut buf, 5, &gauge);
+            }
+            MetricValue::Counter(v) => {
+                // Metric.sum (field 7)
+                let sum = self.encode_sum(*v, point);
+                proto_field(&mut buf, 7, &sum);
+            }
+            MetricValue::Histogram(h) => {
+                // Metric.histogram (field 9)
+                let hist = self.encode_histogram(h, point);
+                proto_field(&mut buf, 9, &hist);
+            }
+        }
+        buf
+    }
+
+    fn encode_gauge(&self, value: f64, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Gauge.data_points (field 1)
+        let dp = self.encode_number_data_point(value, point);
+        proto_field(&mut buf, 1, &dp);
+        buf
+    }
+
+    fn encode_sum(&self, value: u64, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Sum.data_points (field 1)
+        let dp = self.encode_int_data_point(value as i64, point);
+        proto_field(&mut buf, 1, &dp);
+        // Sum.is_monotonic (field 3, varint bool = 1)
+        proto_varint(&mut buf, 3, 1);
+        buf
+    }
+
+    fn encode_histogram(&self, h: &crate::metrics::HistogramData, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Histogram.data_points (field 1)
+        let mut dp = Vec::new();
+        // HistogramDataPoint.time_unix_nano (field 3, fixed64)
+        proto_fixed64(&mut dp, 3, point.timestamp.as_nanos());
+        // HistogramDataPoint.count (field 4, fixed64)
+        proto_fixed64(&mut dp, 4, h.count);
+        // HistogramDataPoint.sum (field 5, double)
+        proto_double(&mut dp, 5, h.sum);
+        // Attributes
+        for (k, v) in &point.tags {
+            let kv = self.encode_key_value(k, v);
+            proto_field(&mut dp, 9, &kv);
+        }
+        proto_field(&mut buf, 1, &dp);
+        buf
+    }
+
+    fn encode_number_data_point(&self, value: f64, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // NumberDataPoint.time_unix_nano (field 3, fixed64)
+        proto_fixed64(&mut buf, 3, point.timestamp.as_nanos());
+        // NumberDataPoint.as_double (field 7, double)
+        proto_double(&mut buf, 7, value);
+        // NumberDataPoint.attributes (field 9, repeated KeyValue)
+        for (k, v) in &point.tags {
+            let kv = self.encode_key_value(k, v);
+            proto_field(&mut buf, 9, &kv);
+        }
+        buf
+    }
+
+    fn encode_int_data_point(&self, value: i64, point: &crate::metrics::MetricPoint) -> Vec<u8> {
+        let mut buf = Vec::new();
+        proto_fixed64(&mut buf, 3, point.timestamp.as_nanos());
+        // NumberDataPoint.as_int (field 6, sfixed64)
+        proto_sfixed64(&mut buf, 6, value);
+        for (k, v) in &point.tags {
+            let kv = self.encode_key_value(k, v);
+            proto_field(&mut buf, 9, &kv);
+        }
+        buf
+    }
+
+    /// Send via standard gRPC/HTTP2 protocol
     fn send_grpc(&self, payload: &[u8]) -> Result<(), OutputError> {
         let mut stream = TcpStream::connect(&self.endpoint)
             .map_err(|e| OutputError::Format(format!("grpc connect {}: {}", self.endpoint, e)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
-        // gRPC frame: compressed=0, length=payload.len()
-        let mut frame = Vec::with_capacity(5 + payload.len());
-        frame.push(0); // not compressed
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload);
+        // === HTTP/2 Connection Preface ===
+        stream.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")?;
 
-        stream.write_all(&frame)?;
+        // === SETTINGS frame (type=0x04, flags=0, stream=0) ===
+        // Empty SETTINGS (use defaults)
+        let settings_frame = http2_frame(0x04, 0x00, 0, &[]);
+        stream.write_all(&settings_frame)?;
+
+        // === HEADERS frame (type=0x01, flags=0x04|0x01 END_HEADERS|END_STREAM not set) ===
+        let headers_payload = self.encode_grpc_headers();
+        let headers_frame = http2_frame(0x01, 0x04, 1, &headers_payload); // END_HEADERS, stream 1
+        stream.write_all(&headers_frame)?;
+
+        // === DATA frame (type=0x00) with gRPC message ===
+        // gRPC message format: [compressed:1][length:4][message]
+        let mut grpc_msg = Vec::with_capacity(5 + payload.len());
+        grpc_msg.push(0x00); // not compressed
+        grpc_msg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        grpc_msg.extend_from_slice(payload);
+
+        let data_frame = http2_frame(0x00, 0x01, 1, &grpc_msg); // END_STREAM, stream 1
+        stream.write_all(&data_frame)?;
         stream.flush()?;
+
+        // Read SETTINGS ACK and response (best effort)
+        let mut resp_buf = [0u8; 512];
+        let _ = stream.read(&mut resp_buf);
         Ok(())
+    }
+
+    /// HPACK-encode gRPC headers for OTLP MetricsService/Export
+    fn encode_grpc_headers(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+
+        // :method POST - indexed (static table index 3)
+        buf.push(0x83); // 1000 0011 = indexed field, index 3
+
+        // :scheme http - indexed (static table index 6)
+        buf.push(0x86); // 1000 0110 = indexed field, index 6
+
+        // :path /opentelemetry.proto.collector.metrics.v1.MetricsService/Export
+        // Literal with indexing, name indexed (static table index 4 = :path)
+        buf.push(0x44); // 0100 0100 = literal with indexing, name index 4
+        let path = b"/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+        hpack_encode_string(&mut buf, path);
+
+        // :authority
+        buf.push(0x41); // 0100 0001 = literal with indexing, name index 1 (:authority)
+        hpack_encode_string(&mut buf, self.endpoint.as_bytes());
+
+        // content-type: application/grpc
+        buf.push(0x40); // literal with indexing, new name
+        hpack_encode_string(&mut buf, b"content-type");
+        hpack_encode_string(&mut buf, b"application/grpc");
+
+        // te: trailers (required for gRPC)
+        buf.push(0x40);
+        hpack_encode_string(&mut buf, b"te");
+        hpack_encode_string(&mut buf, b"trailers");
+
+        buf
     }
 }
 
 impl OutputBackend for GrpcBackend {
     fn write(&self, snapshot: &SystemSnapshot) -> Result<(), OutputError> {
-        let payload = self.encode_binary(snapshot);
+        let payload = self.encode_otlp_protobuf(snapshot);
         self.send_grpc(&payload)
     }
 
     fn name(&self) -> &'static str { "grpc" }
+}
+
+// === Protobuf encoding helpers ===
+
+fn proto_varint_encode(value: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut v = value;
+    loop {
+        let mut byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v != 0 { byte |= 0x80; }
+        buf.push(byte);
+        if v == 0 { break; }
+    }
+    buf
+}
+
+fn proto_field(buf: &mut Vec<u8>, field_num: u32, data: &[u8]) {
+    let tag = (field_num << 3) | 2; // wire type 2 = LEN
+    buf.extend_from_slice(&proto_varint_encode(tag as u64));
+    buf.extend_from_slice(&proto_varint_encode(data.len() as u64));
+    buf.extend_from_slice(data);
+}
+
+fn proto_string(buf: &mut Vec<u8>, field_num: u32, s: &str) {
+    proto_field(buf, field_num, s.as_bytes());
+}
+
+fn proto_varint(buf: &mut Vec<u8>, field_num: u32, value: u64) {
+    let tag = (field_num << 3) | 0; // wire type 0 = VARINT
+    buf.extend_from_slice(&proto_varint_encode(tag as u64));
+    buf.extend_from_slice(&proto_varint_encode(value));
+}
+
+fn proto_fixed64(buf: &mut Vec<u8>, field_num: u32, value: u64) {
+    let tag = (field_num << 3) | 1; // wire type 1 = 64-bit
+    buf.extend_from_slice(&proto_varint_encode(tag as u64));
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn proto_sfixed64(buf: &mut Vec<u8>, field_num: u32, value: i64) {
+    let tag = (field_num << 3) | 1;
+    buf.extend_from_slice(&proto_varint_encode(tag as u64));
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn proto_double(buf: &mut Vec<u8>, field_num: u32, value: f64) {
+    let tag = (field_num << 3) | 1; // wire type 1 = 64-bit
+    buf.extend_from_slice(&proto_varint_encode(tag as u64));
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+// === HTTP/2 framing ===
+
+fn http2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    // 3-byte length
+    frame.push((len >> 16) as u8);
+    frame.push((len >> 8) as u8);
+    frame.push(len as u8);
+    // type, flags
+    frame.push(frame_type);
+    frame.push(flags);
+    // 4-byte stream id (MSB must be 0)
+    frame.extend_from_slice(&(stream_id & 0x7FFFFFFF).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+// === HPACK encoding ===
+
+fn hpack_encode_string(buf: &mut Vec<u8>, s: &[u8]) {
+    // No Huffman encoding (bit 7 = 0), length as 7-bit prefix integer
+    let len = s.len();
+    if len < 127 {
+        buf.push(len as u8);
+    } else {
+        buf.push(127);
+        let mut remaining = len - 127;
+        while remaining >= 128 {
+            buf.push((remaining & 0x7F) as u8 | 0x80);
+            remaining >>= 7;
+        }
+        buf.push(remaining as u8);
+    }
+    buf.extend_from_slice(s);
 }
 
 fn json_escape(s: &str) -> String {

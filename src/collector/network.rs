@@ -9,6 +9,10 @@ pub struct NetworkCollector {
     prev_stats: HashMap<String, IfaceRaw>,
     prev_tcp: Option<TcpRaw>,
     prev_time_ns: Option<u64>,
+    #[cfg(target_os = "linux")]
+    netdev_fd: Option<syscall::PersistentFd>,
+    #[cfg(target_os = "linux")]
+    snmp_fd: Option<syscall::PersistentFd>,
 }
 
 #[derive(Clone)]
@@ -38,6 +42,10 @@ impl NetworkCollector {
             prev_stats: HashMap::new(),
             prev_tcp: None,
             prev_time_ns: None,
+            #[cfg(target_os = "linux")]
+            netdev_fd: syscall::PersistentFd::open(b"/proc/net/dev\0"),
+            #[cfg(target_os = "linux")]
+            snmp_fd: syscall::PersistentFd::open(b"/proc/net/snmp\0"),
         }
     }
 
@@ -113,7 +121,11 @@ impl NetworkCollector {
     #[cfg(target_os = "linux")]
     fn read_net_dev(&self) -> Result<HashMap<String, IfaceRaw>, CollectorError> {
         let mut buf = [0u8; 8192];
-        let n = syscall::read_file_to_buf(b"/proc/net/dev\0", &mut buf);
+        let n = if let Some(pfd) = &self.netdev_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/net/dev\0", &mut buf)
+        };
         if n <= 0 {
             return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-(n as i32))));
         }
@@ -163,7 +175,11 @@ impl NetworkCollector {
     #[cfg(target_os = "linux")]
     fn read_snmp(&self) -> Result<TcpRaw, CollectorError> {
         let mut buf = [0u8; 8192];
-        let n = syscall::read_file_to_buf(b"/proc/net/snmp\0", &mut buf);
+        let n = if let Some(pfd) = &self.snmp_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/net/snmp\0", &mut buf)
+        };
         if n <= 0 {
             return Ok(TcpRaw { retrans_segs: 0, out_segs: 0, curr_estab: 0, in_errs: 0, in_segs: 0 });
         }

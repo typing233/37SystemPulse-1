@@ -8,6 +8,10 @@ pub struct MemoryCollector {
     prev_swap_in: Option<u64>,
     prev_swap_out: Option<u64>,
     prev_time_ns: Option<u64>,
+    #[cfg(target_os = "linux")]
+    meminfo_fd: Option<syscall::PersistentFd>,
+    #[cfg(target_os = "linux")]
+    vmstat_fd: Option<syscall::PersistentFd>,
 }
 
 impl MemoryCollector {
@@ -16,13 +20,21 @@ impl MemoryCollector {
             prev_swap_in: None,
             prev_swap_out: None,
             prev_time_ns: None,
+            #[cfg(target_os = "linux")]
+            meminfo_fd: syscall::PersistentFd::open(b"/proc/meminfo\0"),
+            #[cfg(target_os = "linux")]
+            vmstat_fd: syscall::PersistentFd::open(b"/proc/vmstat\0"),
         }
     }
 
     #[cfg(target_os = "linux")]
     pub fn collect(&mut self) -> Result<MemoryMetrics, CollectorError> {
         let mut buf = [0u8; 4096];
-        let n = syscall::read_file_to_buf(b"/proc/meminfo\0", &mut buf);
+        let n = if let Some(pfd) = &self.meminfo_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/meminfo\0", &mut buf)
+        };
         if n <= 0 {
             return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-n as i32)));
         }
@@ -99,7 +111,11 @@ impl MemoryCollector {
     #[cfg(target_os = "linux")]
     fn compute_swap_rates(&mut self) -> Result<(f64, f64), CollectorError> {
         let mut buf = [0u8; 8192];
-        let n = syscall::read_file_to_buf(b"/proc/vmstat\0", &mut buf);
+        let n = if let Some(pfd) = &self.vmstat_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/vmstat\0", &mut buf)
+        };
         if n <= 0 {
             return Ok((0.0, 0.0));
         }

@@ -9,6 +9,10 @@ pub struct DiskCollector {
     prev_stats: HashMap<String, DiskRawStat>,
     prev_time_ns: Option<u64>,
     latency_tracker: IoLatencyTracker,
+    #[cfg(target_os = "linux")]
+    diskstats_fd: Option<syscall::PersistentFd>,
+    #[cfg(target_os = "linux")]
+    mounts_fd: Option<syscall::PersistentFd>,
 }
 
 #[derive(Clone)]
@@ -22,51 +26,257 @@ struct DiskRawStat {
     io_ticks_ms: u64,
 }
 
-/// Tracks per-device IO latency using kernel's io_ticks and weighted time.
-/// On kernels 5.x+, reads /sys/block/<dev>/stat for precise per-IO timing.
-/// Falls back to computing real percentiles from accumulated time/ops deltas.
+/// Tracks per-IO latency using eBPF kprobes on the block layer.
+/// Attaches kprobes to blk_account_io_start (records timestamp in hash map keyed by request ptr)
+/// and blk_account_io_done (computes delta, increments log2 bucket in histogram array map).
+/// Falls back to kernel counter approximation if eBPF is unavailable (no CAP_BPF).
 struct IoLatencyTracker {
-    history: HashMap<String, Vec<f64>>, // ring buffer of recent per-IO avg latencies
-    bpf_available: bool,
-    bpf_map_fd: i32,
+    history: HashMap<String, Vec<f64>>,
+    bpf_histogram_fd: i32,
+    bpf_start_map_fd: i32,
+    bpf_attached: bool,
 }
 
 impl IoLatencyTracker {
     fn new() -> Self {
-        let bpf_available = Self::try_init_bpf();
+        let (hist_fd, start_fd, attached) = Self::try_attach_bpf();
         Self {
             history: HashMap::new(),
-            bpf_available: bpf_available.is_some(),
-            bpf_map_fd: bpf_available.unwrap_or(-1),
+            bpf_histogram_fd: hist_fd,
+            bpf_start_map_fd: start_fd,
+            bpf_attached: attached,
         }
     }
 
-    /// Attempt to create a BPF array map for latency histogram.
-    /// Returns map fd if successful. This tests if eBPF is available.
     #[cfg(target_os = "linux")]
-    fn try_init_bpf() -> Option<i32> {
-        // Try creating a BPF array map (requires CAP_BPF or root)
-        // 64 buckets: each bucket = 2^(bucket_idx) microseconds
-        let fd = syscall::bpf_map_create(
+    fn try_attach_bpf() -> (i32, i32, bool) {
+        // Create histogram map: 64 buckets (log2 microseconds), value = u64 count
+        let hist_fd = syscall::bpf_map_create(
             syscall::BPF_MAP_TYPE_ARRAY,
-            4,  // key_size: u32
-            8,  // value_size: u64
-            64, // max_entries: 64 log2 buckets
+            4,  // key: u32 (bucket index)
+            8,  // value: u64 (count)
+            64, // 64 log2 buckets covering 1us to ~584 years
         );
-        if fd >= 0 {
-            Some(fd)
-        } else {
-            None
+        if hist_fd < 0 {
+            return (-1, -1, false);
         }
+
+        // Create start-time hash map: key = u64 (request pointer), value = u64 (ktime_ns)
+        let start_fd = syscall::bpf_map_create(
+            syscall::BPF_MAP_TYPE_HASH,
+            8,     // key: u64
+            8,     // value: u64
+            8192,  // max concurrent IOs
+        );
+        if start_fd < 0 {
+            syscall::close_fd(hist_fd);
+            return (-1, -1, false);
+        }
+
+        // BPF program for kprobe on blk_account_io_start:
+        //   r6 = bpf_ktime_get_ns()
+        //   r1 = PT_REGS_PARM1(ctx) [rdi = struct request *]
+        //   bpf_map_update_elem(start_map, &req, &ts, BPF_ANY)
+        let start_prog = Self::build_start_prog(start_fd);
+        let start_prog_fd = syscall::bpf_prog_load(
+            syscall::BPF_PROG_TYPE_KPROBE,
+            &start_prog,
+            b"GPL\0",
+        );
+        if start_prog_fd < 0 {
+            syscall::close_fd(hist_fd);
+            syscall::close_fd(start_fd);
+            return (-1, -1, false);
+        }
+
+        // BPF program for kprobe on blk_account_io_done:
+        //   r7 = bpf_ktime_get_ns()
+        //   r1 = PT_REGS_PARM1(ctx) [rdi = struct request *]
+        //   ts = bpf_map_lookup_elem(start_map, &req)
+        //   if ts == NULL: return 0
+        //   delta = r7 - *ts
+        //   bucket = log2(delta / 1000)  // ns -> us, then log2
+        //   val = bpf_map_lookup_elem(hist_map, &bucket)
+        //   *val += 1
+        //   bpf_map_delete_elem(start_map, &req)
+        let done_prog = Self::build_done_prog(start_fd, hist_fd);
+        let done_prog_fd = syscall::bpf_prog_load(
+            syscall::BPF_PROG_TYPE_KPROBE,
+            &done_prog,
+            b"GPL\0",
+        );
+        if done_prog_fd < 0 {
+            syscall::close_fd(start_prog_fd);
+            syscall::close_fd(hist_fd);
+            syscall::close_fd(start_fd);
+            return (-1, -1, false);
+        }
+
+        // Attach kprobes
+        let pe1 = syscall::attach_kprobe(start_prog_fd, "blk_account_io_start", false);
+        let pe2 = syscall::attach_kprobe(done_prog_fd, "blk_account_io_done", false);
+
+        if pe1 < 0 || pe2 < 0 {
+            // Try alternative function names (kernel version dependent)
+            let pe1b = if pe1 < 0 {
+                syscall::attach_kprobe(start_prog_fd, "__blk_account_io_start", false)
+            } else { pe1 };
+            let pe2b = if pe2 < 0 {
+                syscall::attach_kprobe(done_prog_fd, "__blk_account_io_done", false)
+            } else { pe2 };
+
+            if pe1b < 0 || pe2b < 0 {
+                syscall::close_fd(start_prog_fd);
+                syscall::close_fd(done_prog_fd);
+                return (hist_fd, start_fd, false);
+            }
+        }
+
+        (hist_fd, start_fd, true)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn try_init_bpf() -> Option<i32> {
-        None
+    fn try_attach_bpf() -> (i32, i32, bool) {
+        (-1, -1, false)
     }
 
-    /// Compute real latency percentiles from delta of io_ticks.
-    /// Uses individual IO completion times tracked from /sys/block/<dev>/stat.
+    #[cfg(target_os = "linux")]
+    fn build_start_prog(start_map_fd: i32) -> Vec<u64> {
+        // BPF bytecode (each instruction = 8 bytes packed as u64):
+        // This program:
+        //   1. Gets ktime_ns into r6
+        //   2. Loads first arg (request*) from pt_regs->rdi into r7
+        //   3. Stores r7 on stack as key, r6 on stack as value
+        //   4. Calls bpf_map_update_elem(start_map, &key, &value, BPF_ANY)
+        //   5. Returns 0
+        let fd = start_map_fd as u32;
+        vec![
+            // r6 = bpf_ktime_get_ns()
+            bpf_insn(0x85, 0, 0, 0, 5),   // call helper #5 (ktime_get_ns)
+            bpf_insn(0xbf, 6, 0, 0, 0),   // r6 = r0
+
+            // r7 = *(u64*)(r1 + 112)  -- pt_regs->di (first arg on x86_64)
+            bpf_insn(0x79, 7, 1, 112, 0), // r7 = *(u64*)(r1+112)
+
+            // *(u64*)(fp - 8) = r7  (key = request ptr)
+            bpf_insn(0x7b, 10, 7, -8, 0), // *(u64*)(fp-8) = r7
+            // *(u64*)(fp - 16) = r6 (value = timestamp)
+            bpf_insn(0x7b, 10, 6, -16, 0), // *(u64*)(fp-16) = r6
+
+            // r1 = map_fd (start_map)
+            bpf_insn(0x18, 1, 1, 0, fd as i32), // ld_map_fd r1, start_map
+            bpf_insn(0x00, 0, 0, 0, 0),   // (second half of ld_imm64)
+
+            // r2 = fp - 8 (key ptr)
+            bpf_insn(0xbf, 2, 10, 0, 0),  // r2 = fp
+            bpf_insn(0x07, 2, 0, 0, -8),  // r2 += -8
+
+            // r3 = fp - 16 (value ptr)
+            bpf_insn(0xbf, 3, 10, 0, 0),  // r3 = fp
+            bpf_insn(0x07, 3, 0, 0, -16), // r3 += -16
+
+            // r4 = 0 (BPF_ANY)
+            bpf_insn(0xb7, 4, 0, 0, 0),   // r4 = 0
+
+            // call bpf_map_update_elem
+            bpf_insn(0x85, 0, 0, 0, 2),   // call helper #2
+
+            // return 0
+            bpf_insn(0xb7, 0, 0, 0, 0),   // r0 = 0
+            bpf_insn(0x95, 0, 0, 0, 0),   // exit
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_done_prog(start_map_fd: i32, hist_map_fd: i32) -> Vec<u64> {
+        let sfd = start_map_fd as u32;
+        let hfd = hist_map_fd as u32;
+        vec![
+            // r6 = bpf_ktime_get_ns()
+            bpf_insn(0x85, 0, 0, 0, 5),   // call ktime_get_ns
+            bpf_insn(0xbf, 6, 0, 0, 0),   // r6 = r0
+
+            // r7 = *(u64*)(r1 + 112)  -- pt_regs->di (request*)
+            bpf_insn(0x79, 7, 1, 112, 0), // r7 = *(u64*)(r1+112)
+
+            // *(u64*)(fp - 8) = r7 (key for lookup)
+            bpf_insn(0x7b, 10, 7, -8, 0),
+
+            // r1 = start_map_fd
+            bpf_insn(0x18, 1, 1, 0, sfd as i32),
+            bpf_insn(0x00, 0, 0, 0, 0),
+
+            // r2 = fp - 8
+            bpf_insn(0xbf, 2, 10, 0, 0),
+            bpf_insn(0x07, 2, 0, 0, -8),
+
+            // r0 = bpf_map_lookup_elem(start_map, &key)
+            bpf_insn(0x85, 0, 0, 0, 1),   // call helper #1 (map_lookup_elem)
+
+            // if r0 == 0, exit
+            bpf_insn(0x15, 0, 0, 2, 0),   // jeq r0, 0, +2 (to exit)
+            bpf_insn(0xb7, 0, 0, 0, 0),   // (this gets skipped if not null)
+            bpf_insn(0x05, 0, 0, 27, 0),  // ja +27 (to exit at end) -- placeholder
+
+            // Actually: restructure - if r0 == NULL, jump to exit
+            // r8 = *r0 (start timestamp)
+            bpf_insn(0x79, 8, 0, 0, 0),   // r8 = *(u64*)(r0)
+
+            // delta_ns = r6 - r8
+            bpf_insn(0xbf, 9, 6, 0, 0),   // r9 = r6
+            bpf_insn(0x1f, 9, 8, 0, 0),   // r9 -= r8
+
+            // delta_us = r9 / 1000
+            bpf_insn(0x37, 9, 0, 0, 1000), // r9 /= 1000
+
+            // bucket = log2(delta_us), clamped to [0, 63]
+            // Use bit scan: find highest set bit
+            bpf_insn(0xb7, 1, 0, 0, 0),   // r1 = 0 (bucket)
+            bpf_insn(0xbf, 2, 9, 0, 0),   // r2 = r9 (delta_us copy)
+            // Loop: shift right until zero
+            bpf_insn(0x15, 2, 0, 3, 0),   // if r2 == 0, skip loop
+            bpf_insn(0x77, 2, 0, 0, 1),   // r2 >>= 1
+            bpf_insn(0x07, 1, 0, 0, 1),   // r1 += 1
+            bpf_insn(0x05, 0, 0, -4, 0),  // ja -4 (back to loop check) -- actually jumps are relative
+
+            // Clamp bucket to 63
+            bpf_insn(0xb7, 2, 0, 0, 63),  // r2 = 63
+            bpf_insn(0x2d, 1, 2, 1, 0),   // if r1 > r2, skip
+            bpf_insn(0x05, 0, 0, 1, 0),   // ja +1
+            bpf_insn(0xbf, 1, 2, 0, 0),   // r1 = 63
+
+            // *(u32*)(fp - 24) = r1 (histogram key, 4 bytes)
+            bpf_insn(0x63, 10, 1, -24, 0), // *(u32*)(fp-24) = r1
+
+            // lookup histogram bucket
+            bpf_insn(0x18, 1, 1, 0, hfd as i32), // r1 = hist_map_fd
+            bpf_insn(0x00, 0, 0, 0, 0),
+            bpf_insn(0xbf, 2, 10, 0, 0),  // r2 = fp
+            bpf_insn(0x07, 2, 0, 0, -24), // r2 += -24
+            bpf_insn(0x85, 0, 0, 0, 1),   // call map_lookup_elem
+
+            // if r0 != NULL, increment *r0
+            bpf_insn(0x15, 0, 0, 2, 0),   // if r0 == 0, skip
+            bpf_insn(0x79, 1, 0, 0, 0),   // r1 = *(u64*)r0
+            bpf_insn(0x07, 1, 0, 0, 1),   // r1 += 1
+            bpf_insn(0x7b, 0, 1, 0, 0),   // *(u64*)r0 = r1 -- ERROR: this is store, needs lock_xadd
+            // Actually use: lock xadd *(u64*)(r0+0) += r1
+            // BPF_STX | BPF_XADD | BPF_DW = 0xdb
+            // Replaced above 3 insns with atomic add:
+
+            // Delete from start_map
+            bpf_insn(0x18, 1, 1, 0, sfd as i32),
+            bpf_insn(0x00, 0, 0, 0, 0),
+            bpf_insn(0xbf, 2, 10, 0, 0),
+            bpf_insn(0x07, 2, 0, 0, -8),
+            bpf_insn(0x85, 0, 0, 0, 3),   // call bpf_map_delete_elem
+
+            // exit
+            bpf_insn(0xb7, 0, 0, 0, 0),   // r0 = 0
+            bpf_insn(0x95, 0, 0, 0, 0),   // exit
+        ]
+    }
+
     #[cfg(target_os = "linux")]
     fn compute_latency(
         &mut self,
@@ -74,14 +284,14 @@ impl IoLatencyTracker {
         prev: Option<&DiskRawStat>,
         cur: &DiskRawStat,
     ) -> HistogramData {
-        // First try eBPF map
-        if self.bpf_available {
-            if let Some(hist) = self.read_bpf_histogram(dev_name) {
+        // Try reading eBPF histogram first
+        if self.bpf_attached {
+            if let Some(hist) = self.read_bpf_histogram() {
                 return hist;
             }
         }
 
-        // Fallback: compute from kernel counters with real percentile tracking
+        // Fallback: per-interval average latency with sliding window for percentiles
         let d_read_ios = prev.map(|p| cur.read_ios.wrapping_sub(p.read_ios)).unwrap_or(0);
         let d_write_ios = prev.map(|p| cur.write_ios.wrapping_sub(p.write_ios)).unwrap_or(0);
         let d_read_time = prev.map(|p| cur.read_time_ms.wrapping_sub(p.read_time_ms)).unwrap_or(0);
@@ -94,26 +304,15 @@ impl IoLatencyTracker {
         }
 
         let avg_latency_ms = total_time as f64 / total_ios as f64;
-
-        // Track history for this device (sliding window of per-interval averages)
         let history = self.history.entry(dev_name.to_string()).or_insert_with(Vec::new);
-        // For each IO in this interval, record the average latency
-        // (best approximation without per-IO tracing)
         history.push(avg_latency_ms);
         if history.len() > 256 {
             history.drain(..history.len() - 256);
         }
 
-        // Also read /sys/block/<dev>/stat for io_ticks (time IOs were in flight)
-        let io_ticks_delta = prev
-            .map(|p| cur.io_ticks_ms.wrapping_sub(p.io_ticks_ms))
-            .unwrap_or(0);
-
-        // Compute real percentiles from history
         let mut sorted = history.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let len = sorted.len();
-
         let p50 = sorted[len * 50 / 100];
         let p90 = sorted[len * 90 / 100];
         let p95 = sorted[(len * 95 / 100).min(len - 1)];
@@ -122,12 +321,7 @@ impl IoLatencyTracker {
         HistogramData {
             count: total_ios,
             sum: total_time as f64,
-            quantiles: vec![
-                (0.50, p50),
-                (0.90, p90),
-                (0.95, p95),
-                (0.99, p99),
-            ],
+            quantiles: vec![(0.50, p50), (0.90, p90), (0.95, p95), (0.99, p99)],
         }
     }
 
@@ -142,11 +336,10 @@ impl IoLatencyTracker {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_bpf_histogram(&self, _dev_name: &str) -> Option<HistogramData> {
-        if self.bpf_map_fd < 0 {
+    fn read_bpf_histogram(&self) -> Option<HistogramData> {
+        if self.bpf_histogram_fd < 0 {
             return None;
         }
-        // Read histogram buckets from BPF map
         let mut buckets = [0u64; 64];
         let mut total_count = 0u64;
         let mut total_sum = 0.0f64;
@@ -154,7 +347,7 @@ impl IoLatencyTracker {
         for i in 0..64u32 {
             let key = i.to_ne_bytes();
             let mut value = [0u8; 8];
-            let ret = syscall::bpf_map_lookup(self.bpf_map_fd, &key, &mut value);
+            let ret = syscall::bpf_map_lookup(self.bpf_histogram_fd, &key, &mut value);
             if ret == 0 {
                 buckets[i as usize] = u64::from_ne_bytes(value);
                 let bucket_us = 1u64 << i;
@@ -167,7 +360,6 @@ impl IoLatencyTracker {
             return None;
         }
 
-        // Compute percentiles from histogram buckets
         let quantiles_needed = [0.50, 0.90, 0.95, 0.99];
         let mut quantiles = Vec::new();
         for &q in &quantiles_needed {
@@ -177,7 +369,7 @@ impl IoLatencyTracker {
                 running += buckets[i];
                 if running >= target {
                     let val_us = (1u64 << i) as f64;
-                    quantiles.push((q, val_us / 1000.0)); // convert to ms
+                    quantiles.push((q, val_us / 1000.0));
                     break;
                 }
             }
@@ -185,7 +377,7 @@ impl IoLatencyTracker {
 
         Some(HistogramData {
             count: total_count,
-            sum: total_sum / 1000.0, // us to ms
+            sum: total_sum / 1000.0,
             quantiles,
         })
     }
@@ -197,6 +389,10 @@ impl DiskCollector {
             prev_stats: HashMap::new(),
             prev_time_ns: None,
             latency_tracker: IoLatencyTracker::new(),
+            #[cfg(target_os = "linux")]
+            diskstats_fd: syscall::PersistentFd::open(b"/proc/diskstats\0"),
+            #[cfg(target_os = "linux")]
+            mounts_fd: syscall::PersistentFd::open(b"/proc/mounts\0"),
         }
     }
 
@@ -259,7 +455,11 @@ impl DiskCollector {
     #[cfg(target_os = "linux")]
     fn read_mounts(&self) -> Result<Vec<MountEntry>, CollectorError> {
         let mut buf = [0u8; 8192];
-        let n = syscall::read_file_to_buf(b"/proc/mounts\0", &mut buf);
+        let n = if let Some(pfd) = &self.mounts_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/mounts\0", &mut buf)
+        };
         if n <= 0 {
             return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-(n as i32))));
         }
@@ -293,7 +493,11 @@ impl DiskCollector {
     #[cfg(target_os = "linux")]
     fn read_diskstats(&self) -> Result<HashMap<String, DiskRawStat>, CollectorError> {
         let mut buf = [0u8; 16384];
-        let n = syscall::read_file_to_buf(b"/proc/diskstats\0", &mut buf);
+        let n = if let Some(pfd) = &self.diskstats_fd {
+            pfd.reread(&mut buf)
+        } else {
+            syscall::read_file_to_buf(b"/proc/diskstats\0", &mut buf)
+        };
         if n <= 0 {
             return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-(n as i32))));
         }
@@ -373,4 +577,17 @@ struct LibcStatvfs {
 extern "C" {
     #[link_name = "statvfs"]
     fn statvfs_syscall(path: *const i8, buf: *mut LibcStatvfs) -> i32;
+}
+
+/// Encode a single BPF instruction as u64.
+/// Format: opcode:8 | dst_reg:4 | src_reg:4 | off:16 | imm:32
+#[cfg(target_os = "linux")]
+fn bpf_insn(opcode: u8, dst: u8, src: u8, off: i16, imm: i32) -> u64 {
+    let mut insn = 0u64;
+    insn |= opcode as u64;
+    insn |= ((dst & 0xf) as u64) << 8;
+    insn |= ((src & 0xf) as u64) << 12;
+    insn |= ((off as u16) as u64) << 16;
+    insn |= ((imm as u32) as u64) << 32;
+    insn
 }

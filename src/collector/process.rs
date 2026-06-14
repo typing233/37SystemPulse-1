@@ -100,6 +100,17 @@ impl ProcessCollector {
         processes.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
         processes.truncate(50);
 
+        // Guarantee self is always in the list
+        let my_pid = std::process::id();
+        if !processes.iter().any(|p| p.pid == my_pid) {
+            if let Ok((self_info, _)) = self.read_process_fast(my_pid, dt_secs) {
+                if processes.len() >= 50 {
+                    processes.pop();
+                }
+                processes.push(self_info);
+            }
+        }
+
         // Only count FDs and cgroup details for top processes (expensive operations)
         let mut path_buf = [0u8; 64];
         for proc in &mut processes {
