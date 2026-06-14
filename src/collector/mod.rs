@@ -2,7 +2,6 @@ use crate::metrics::SystemSnapshot;
 
 pub trait Collector: Send + Sync {
     fn collect(&mut self) -> Result<SystemSnapshot, CollectorError>;
-    fn name(&self) -> &'static str;
 }
 
 #[derive(Debug)]

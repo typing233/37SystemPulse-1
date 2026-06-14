@@ -19,6 +19,11 @@ pub struct Engine {
     freq_ctrl: FrequencyController,
     output: OutputRouter,
     hostname: String,
+    interval: Duration,
+    last_process_ns: u64,
+    last_disk_ns: u64,
+    cached_processes: ProcessMetrics,
+    cached_disk: DiskMetrics,
 }
 
 impl Engine {
@@ -34,6 +39,11 @@ impl Engine {
             freq_ctrl: FrequencyController::new(interval, temp_threshold),
             output: OutputRouter::new(),
             hostname,
+            interval,
+            last_process_ns: 0,
+            last_disk_ns: 0,
+            cached_processes: ProcessMetrics { processes: Vec::new() },
+            cached_disk: DiskMetrics { devices: Vec::new() },
         }
     }
 
@@ -49,9 +59,33 @@ impl Engine {
 
         let cpu = self.cpu.collect().map_err(|e| format!("cpu: {}", e))?;
         let memory = self.memory.collect().map_err(|e| format!("memory: {}", e))?;
-        let disk = self.disk.collect().map_err(|e| format!("disk: {}", e))?;
         let network = self.network.collect().map_err(|e| format!("network: {}", e))?;
-        let processes = self.process.collect().map_err(|e| format!("process: {}", e))?;
+
+        // Rate-limit disk collection: minimum 500ms between scans
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let slow_interval_ns = 500_000_000u64.max(self.interval.as_nanos() as u64);
+
+        let disk = if now_ns.saturating_sub(self.last_disk_ns) >= slow_interval_ns {
+            self.last_disk_ns = now_ns;
+            let d = self.disk.collect().map_err(|e| format!("disk: {}", e))?;
+            self.cached_disk = d.clone();
+            d
+        } else {
+            self.cached_disk.clone()
+        };
+
+        // Rate-limit process collection: minimum 500ms between scans
+        let processes = if now_ns.saturating_sub(self.last_process_ns) >= slow_interval_ns {
+            self.last_process_ns = now_ns;
+            let p = self.process.collect().map_err(|e| format!("process: {}", e))?;
+            self.cached_processes = p.clone();
+            p
+        } else {
+            self.cached_processes.clone()
+        };
 
         Ok(SystemSnapshot {
             timestamp: Timestamp::now(),
@@ -77,8 +111,7 @@ impl Engine {
                     if self.freq_ctrl.is_throttled() {
                         eprintln!(
                             "[throttle] temp={:.1}°C interval={}ms",
-                            temp,
-                            interval.as_millis()
+                            temp, interval.as_millis()
                         );
                     }
                     std::thread::sleep(interval);

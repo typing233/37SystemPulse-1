@@ -20,7 +20,6 @@ mod tests {
     fn test_cpu_collector_first_sample_returns_zeros() {
         let mut cpu = CpuCollector::new();
         let result = cpu.collect();
-        // First sample has no delta, should return zeros
         if let Ok(metrics) = result {
             assert_eq!(metrics.total.idle_pct, 100.0);
         }
@@ -68,7 +67,7 @@ mod tests {
     #[test]
     fn test_network_collector_no_loopback() {
         let mut net = NetworkCollector::new();
-        let _ = net.collect(); // prime
+        let _ = net.collect();
         std::thread::sleep(Duration::from_millis(50));
         if let Ok(metrics) = net.collect() {
             for iface in &metrics.interfaces {
@@ -79,39 +78,66 @@ mod tests {
 
     #[test]
     fn test_process_collector_finds_self() {
-        let proc_col = ProcessCollector::new();
+        let mut proc_col = ProcessCollector::new();
+        // First call primes the tick baseline
+        let _ = proc_col.collect();
+        std::thread::sleep(Duration::from_millis(50));
         if let Ok(metrics) = proc_col.collect() {
             let my_pid = std::process::id();
             let found = metrics.processes.iter().any(|p| p.pid == my_pid);
-            assert!(found, "should find our own process");
+            assert!(found, "should find our own process (pid={})", my_pid);
+        }
+    }
+
+    #[test]
+    fn test_process_cpu_pct_reasonable() {
+        let mut proc_col = ProcessCollector::new();
+        let _ = proc_col.collect();
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(metrics) = proc_col.collect() {
+            for proc in &metrics.processes {
+                // CPU% per process should be 0-num_cpus*100 at most
+                assert!(
+                    proc.cpu_pct <= 800.0,
+                    "process {} has unreasonable cpu_pct={:.1}%",
+                    proc.name, proc.cpu_pct
+                );
+                assert!(
+                    proc.cpu_pct >= 0.0,
+                    "process {} has negative cpu_pct={:.1}%",
+                    proc.name, proc.cpu_pct
+                );
+            }
         }
     }
 
     #[test]
     fn test_thermal_collector_no_panic() {
         let thermal = ThermalCollector::new();
-        let _ = thermal.collect(); // should not panic even if no thermal zones
+        let _ = thermal.collect();
     }
 
     // ─── White-box: output backend correctness ───
 
     #[test]
-    fn test_influx_line_protocol_format() {
+    fn test_influx_output_includes_all_metrics() {
         let snapshot = make_test_snapshot();
         let points = snapshot.to_metric_points();
-        assert!(!points.is_empty());
-        // Verify influx format properties
-        for point in &points {
-            assert!(!point.name.is_empty());
-            assert!(!point.name.contains(' '));
-        }
+        let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
+        // Verify all major categories are present
+        assert!(names.iter().any(|n| n.starts_with("cpu.")), "missing CPU metrics");
+        assert!(names.iter().any(|n| n.starts_with("memory.")), "missing memory metrics");
+        assert!(names.iter().any(|n| n.starts_with("disk.")), "missing disk metrics");
+        assert!(names.iter().any(|n| n.starts_with("net.")), "missing network metrics");
+        assert!(names.iter().any(|n| n.starts_with("thermal.")), "missing thermal metrics");
+        assert!(names.iter().any(|n| n.starts_with("process.")), "missing process metrics");
+        assert!(names.iter().any(|n| *n == "net.packet_loss_rate"), "missing packet_loss_rate");
     }
 
     #[test]
     fn test_json_output_valid() {
         let snapshot = make_test_snapshot();
         let backend = crate::output::json::JsonBackend::new();
-        // Capture would need redirect; just verify no panic
         let _ = backend.write(&snapshot);
     }
 
@@ -124,14 +150,15 @@ mod tests {
             for _ in 0..1000 {
                 handle.switch(BackendType::Json);
                 handle.switch(BackendType::Influx);
+                handle.switch(BackendType::Http);
+                handle.switch(BackendType::Grpc);
                 handle.switch(BackendType::Table);
             }
         });
 
-        // Concurrent reads should never see invalid index
         for _ in 0..1000 {
             let t = router.active_type();
-            assert!((t as usize) < 3);
+            assert!((t as usize) < 5);
         }
         switch_thread.join().unwrap();
     }
@@ -141,7 +168,6 @@ mod tests {
     #[test]
     fn test_frequency_rapid_oscillation() {
         let mut fc = FrequencyController::new(Duration::from_millis(100), 80.0);
-        // Rapid temperature oscillation should not cause issues
         for i in 0..100 {
             let temp = if i % 2 == 0 { 95.0 } else { 70.0 };
             let interval = fc.update(temp);
@@ -153,7 +179,6 @@ mod tests {
     #[test]
     fn test_frequency_extreme_temperature() {
         let mut fc = FrequencyController::new(Duration::from_millis(100), 80.0);
-        // Extreme temp should be capped at max backoff
         let interval = fc.update(10000.0);
         assert_eq!(interval, Duration::from_millis(1000));
     }
@@ -177,7 +202,6 @@ mod tests {
     #[test]
     fn test_engine_performance_budget() {
         let mut engine = Engine::new(Duration::from_millis(100), 85.0);
-        // Warm up
         let _ = engine.collect_once();
         std::thread::sleep(Duration::from_millis(100));
 
@@ -189,7 +213,6 @@ mod tests {
         let elapsed = start.elapsed();
         let per_collection = elapsed / iterations;
 
-        // Each collection should complete well under 100ms
         assert!(
             per_collection < Duration::from_millis(50),
             "collection took {:?} per iteration, budget exceeded",
@@ -206,7 +229,7 @@ mod tests {
         }
     }
 
-    // ─── Chaos: simulate resource exhaustion ───
+    // ─── Chaos ───
 
     #[test]
     fn test_concurrent_collection_safety() {
@@ -226,11 +249,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_http_backend_format_no_panic() {
+        let snapshot = make_test_snapshot();
+        let backend = crate::output::remote::HttpBackend::new();
+        // Will fail to connect but should not panic during formatting
+        let _ = backend.write(&snapshot);
+    }
+
+    #[test]
+    fn test_grpc_backend_encode_no_panic() {
+        let snapshot = make_test_snapshot();
+        let backend = crate::output::remote::GrpcBackend::new();
+        let _ = backend.write(&snapshot);
+    }
+
     // ─── Helper ───
 
     fn make_test_snapshot() -> SystemSnapshot {
         let mut engine = Engine::new(Duration::from_millis(100), 85.0);
-        let _ = engine.collect_once(); // prime
+        let _ = engine.collect_once();
         std::thread::sleep(Duration::from_millis(50));
         engine.collect_once().expect("test snapshot collection failed")
     }

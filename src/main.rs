@@ -3,6 +3,7 @@ mod engine;
 mod frequency;
 mod metrics;
 mod output;
+pub mod platform;
 #[cfg(test)]
 mod chaos_tests;
 
@@ -33,8 +34,10 @@ fn main() {
                         "json" => BackendType::Json,
                         "table" => BackendType::Table,
                         "influx" => BackendType::Influx,
-                        _ => {
-                            eprintln!("unknown backend: {}, using influx", args[i]);
+                        "http" => BackendType::Http,
+                        "grpc" => BackendType::Grpc,
+                        other => {
+                            eprintln!("unknown backend: {}, using influx", other);
                             BackendType::Influx
                         }
                     };
@@ -66,9 +69,7 @@ fn main() {
 
     eprintln!(
         "syspulse: interval={}ms backend={} threshold={:.0}°C",
-        interval_ms,
-        backend.as_str(),
-        temp_threshold
+        interval_ms, backend.as_str(), temp_threshold
     );
 
     if one_shot {
@@ -98,20 +99,23 @@ USAGE:
 
 OPTIONS:
     -i, --interval <ms>       Sampling interval in milliseconds [default: 1000]
-    -o, --output <backend>    Output backend: json|table|influx [default: influx]
+    -o, --output <backend>    Output backend: json|table|influx|http|grpc [default: influx]
     -t, --temp-threshold <C>  Temperature threshold for throttling [default: 85]
         --once                Collect once and exit
     -h, --help                Print this help
 
-ARCHITECTURE:
-    Collectors read from /proc, /sys (Linux), sysctl (macOS), or WMI (Windows).
-    Output backends are hot-swappable at runtime via atomic pointer switch.
-    Thermal-driven dynamic frequency control backs off when CPU temp exceeds threshold.
-
-OUTPUT FORMATS:
-    influx  - InfluxDB line protocol (default, suitable for piping to telegraf)
-    json    - NDJSON with OpenTelemetry-compatible metric structure
+OUTPUT BACKENDS:
+    influx  - InfluxDB line protocol (piping to telegraf/influxdb)
+    json    - NDJSON with OpenTelemetry-compatible structure
     table   - Terminal dashboard with ANSI colors
+    http    - OTLP/HTTP POST (set SYSPULSE_HTTP_ENDPOINT=host:port/path)
+    grpc    - gRPC binary framing (set SYSPULSE_GRPC_ENDPOINT=host:port)
+
+ARCHITECTURE:
+    Zero-copy collectors use raw syscalls (pread/getdents64) into stack buffers.
+    eBPF map support for IO latency histograms (requires CAP_BPF).
+    Output backends are hot-swappable at runtime via atomic index switch.
+    Thermal-driven dynamic frequency control (backs off up to 10x).
 "
     );
 }
@@ -121,20 +125,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_output_backend_switch() {
+    fn test_output_backend_switch_all() {
         let router = output::OutputRouter::new();
-        assert_eq!(router.active_type(), BackendType::Influx);
-
-        router.switch(BackendType::Json);
-        assert_eq!(router.active_type(), BackendType::Json);
-
-        router.switch(BackendType::Table);
-        assert_eq!(router.active_type(), BackendType::Table);
+        for bt in [BackendType::Json, BackendType::Table, BackendType::Influx, BackendType::Http, BackendType::Grpc] {
+            router.switch(bt);
+            assert_eq!(router.active_type(), bt);
+        }
     }
 
     #[test]
     fn test_backend_type_roundtrip() {
-        for v in 0..3 {
+        for v in 0..5 {
             let bt = BackendType::from_usize(v);
             assert_eq!(bt as usize, v);
         }

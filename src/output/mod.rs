@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod influx;
 pub mod json;
+pub mod remote;
 pub mod table;
 
 pub trait OutputBackend: Send + Sync {
@@ -38,6 +39,8 @@ pub enum BackendType {
     Json = 0,
     Table = 1,
     Influx = 2,
+    Http = 3,
+    Grpc = 4,
 }
 
 impl BackendType {
@@ -46,6 +49,8 @@ impl BackendType {
             0 => Self::Json,
             1 => Self::Table,
             2 => Self::Influx,
+            3 => Self::Http,
+            4 => Self::Grpc,
             _ => Self::Json,
         }
     }
@@ -55,6 +60,8 @@ impl BackendType {
             Self::Json => "json",
             Self::Table => "table",
             Self::Influx => "influx",
+            Self::Http => "http",
+            Self::Grpc => "grpc",
         }
     }
 }
@@ -70,6 +77,8 @@ impl OutputRouter {
             Box::new(json::JsonBackend::new()),
             Box::new(table::TableBackend::new()),
             Box::new(influx::InfluxBackend::new()),
+            Box::new(remote::HttpBackend::new()),
+            Box::new(remote::GrpcBackend::new()),
         ];
         Self {
             backends,
@@ -86,9 +95,7 @@ impl OutputRouter {
     }
 
     pub fn handle(&self) -> OutputHandle {
-        OutputHandle {
-            active: self.active.clone(),
-        }
+        OutputHandle { active: self.active.clone() }
     }
 
     pub fn write(&self, snapshot: &SystemSnapshot) -> Result<(), OutputError> {

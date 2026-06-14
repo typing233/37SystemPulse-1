@@ -30,7 +30,7 @@ pub enum MetricValue {
 pub struct HistogramData {
     pub count: u64,
     pub sum: f64,
-    pub quantiles: Vec<(f64, f64)>, // (quantile, value)
+    pub quantiles: Vec<(f64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,8 +69,8 @@ pub struct MemoryMetrics {
     pub buffers_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
-    pub swap_in_rate: f64,  // bytes/sec
-    pub swap_out_rate: f64, // bytes/sec
+    pub swap_in_rate: f64,
+    pub swap_out_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -167,16 +167,16 @@ pub struct ThermalZone {
 
 impl SystemSnapshot {
     pub fn to_metric_points(&self) -> Vec<MetricPoint> {
-        let mut points = Vec::with_capacity(256);
+        let mut points = Vec::with_capacity(512);
         let ts = self.timestamp.clone();
         let mut host_tags = HashMap::new();
         host_tags.insert("host".to_string(), self.hostname.clone());
 
-        // CPU metrics
+        // ─── CPU per-core ───
         for core in &self.cpu.per_core {
             let mut tags = host_tags.clone();
             tags.insert("core".to_string(), core.core_id.to_string());
-            let fields = [
+            for (name, val) in [
                 ("cpu.user", core.user_pct),
                 ("cpu.system", core.system_pct),
                 ("cpu.softirq", core.softirq_pct),
@@ -184,85 +184,204 @@ impl SystemSnapshot {
                 ("cpu.idle", core.idle_pct),
                 ("cpu.iowait", core.iowait_pct),
                 ("cpu.steal", core.steal_pct),
-            ];
-            for (name, val) in fields {
+            ] {
                 points.push(MetricPoint {
-                    name: name.to_string(),
-                    tags: tags.clone(),
-                    value: MetricValue::Gauge(val),
-                    timestamp: ts.clone(),
-                    unit: "percent",
+                    name: name.to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(val), timestamp: ts.clone(), unit: "percent",
+                });
+            }
+        }
+        // CPU total
+        {
+            let mut tags = host_tags.clone();
+            tags.insert("core".to_string(), "total".to_string());
+            for (name, val) in [
+                ("cpu.user", self.cpu.total.user_pct),
+                ("cpu.system", self.cpu.total.system_pct),
+                ("cpu.softirq", self.cpu.total.softirq_pct),
+                ("cpu.hardirq", self.cpu.total.hardirq_pct),
+                ("cpu.idle", self.cpu.total.idle_pct),
+                ("cpu.iowait", self.cpu.total.iowait_pct),
+                ("cpu.steal", self.cpu.total.steal_pct),
+            ] {
+                points.push(MetricPoint {
+                    name: name.to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(val), timestamp: ts.clone(), unit: "percent",
                 });
             }
         }
 
-        // Memory metrics
-        let mem_fields: Vec<(&str, u64)> = vec![
-            ("memory.total", self.memory.total_bytes),
-            ("memory.used", self.memory.used_bytes),
-            ("memory.available", self.memory.available_bytes),
-            ("memory.cached", self.memory.cached_bytes),
-            ("memory.buffers", self.memory.buffers_bytes),
-            ("memory.swap_total", self.memory.swap_total_bytes),
-            ("memory.swap_used", self.memory.swap_used_bytes),
-        ];
-        for (name, val) in mem_fields {
+        // ─── Memory ───
+        for (name, val, unit) in [
+            ("memory.total", self.memory.total_bytes as f64, "bytes"),
+            ("memory.used", self.memory.used_bytes as f64, "bytes"),
+            ("memory.available", self.memory.available_bytes as f64, "bytes"),
+            ("memory.cached", self.memory.cached_bytes as f64, "bytes"),
+            ("memory.buffers", self.memory.buffers_bytes as f64, "bytes"),
+            ("memory.swap_total", self.memory.swap_total_bytes as f64, "bytes"),
+            ("memory.swap_used", self.memory.swap_used_bytes as f64, "bytes"),
+            ("memory.swap_in_rate", self.memory.swap_in_rate, "bytes/s"),
+            ("memory.swap_out_rate", self.memory.swap_out_rate, "bytes/s"),
+        ] {
             points.push(MetricPoint {
-                name: name.to_string(),
-                tags: host_tags.clone(),
-                value: MetricValue::Gauge(val as f64),
-                timestamp: ts.clone(),
-                unit: "bytes",
+                name: name.to_string(), tags: host_tags.clone(),
+                value: MetricValue::Gauge(val), timestamp: ts.clone(), unit,
             });
         }
-        points.push(MetricPoint {
-            name: "memory.swap_in_rate".to_string(),
-            tags: host_tags.clone(),
-            value: MetricValue::Gauge(self.memory.swap_in_rate),
-            timestamp: ts.clone(),
-            unit: "bytes/s",
-        });
-        points.push(MetricPoint {
-            name: "memory.swap_out_rate".to_string(),
-            tags: host_tags.clone(),
-            value: MetricValue::Gauge(self.memory.swap_out_rate),
-            timestamp: ts.clone(),
-            unit: "bytes/s",
-        });
 
-        // Network metrics
+        // ─── Disk (per device) ───
+        for dev in &self.disk.devices {
+            let mut tags = host_tags.clone();
+            tags.insert("device".to_string(), dev.name.clone());
+            tags.insert("mount".to_string(), dev.mount_point.clone());
+            tags.insert("fstype".to_string(), dev.fs_type.clone());
+            for (name, val, unit) in [
+                ("disk.total", dev.total_bytes as f64, "bytes"),
+                ("disk.used", dev.used_bytes as f64, "bytes"),
+                ("disk.available", dev.available_bytes as f64, "bytes"),
+                ("disk.read_bytes_per_sec", dev.read_bytes_per_sec, "bytes/s"),
+                ("disk.write_bytes_per_sec", dev.write_bytes_per_sec, "bytes/s"),
+            ] {
+                points.push(MetricPoint {
+                    name: name.to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(val), timestamp: ts.clone(), unit,
+                });
+            }
+            // IO latency as histogram
+            if !dev.io_latency.quantiles.is_empty() {
+                points.push(MetricPoint {
+                    name: "disk.io_latency".to_string(), tags: tags.clone(),
+                    value: MetricValue::Histogram(dev.io_latency.clone()),
+                    timestamp: ts.clone(), unit: "ms",
+                });
+            }
+        }
+
+        // ─── Network (per interface) ───
         for iface in &self.network.interfaces {
             let mut tags = host_tags.clone();
             tags.insert("interface".to_string(), iface.name.clone());
+            for (name, val, unit) in [
+                ("net.rx_bytes_per_sec", iface.rx_bytes_per_sec, "bytes/s"),
+                ("net.tx_bytes_per_sec", iface.tx_bytes_per_sec, "bytes/s"),
+                ("net.rx_packets_per_sec", iface.rx_packets_per_sec, "packets/s"),
+                ("net.tx_packets_per_sec", iface.tx_packets_per_sec, "packets/s"),
+                ("net.rx_errors", iface.rx_errors as f64, "count"),
+                ("net.tx_errors", iface.tx_errors as f64, "count"),
+                ("net.rx_dropped", iface.rx_dropped as f64, "count"),
+                ("net.tx_dropped", iface.tx_dropped as f64, "count"),
+            ] {
+                points.push(MetricPoint {
+                    name: name.to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(val), timestamp: ts.clone(), unit,
+                });
+            }
+        }
+        // Network global TCP stats
+        points.push(MetricPoint {
+            name: "net.tcp_connections".to_string(), tags: host_tags.clone(),
+            value: MetricValue::Gauge(self.network.tcp_connections as f64),
+            timestamp: ts.clone(), unit: "count",
+        });
+        points.push(MetricPoint {
+            name: "net.tcp_retransmit_rate".to_string(), tags: host_tags.clone(),
+            value: MetricValue::Gauge(self.network.tcp_retransmit_rate),
+            timestamp: ts.clone(), unit: "percent",
+        });
+        points.push(MetricPoint {
+            name: "net.packet_loss_rate".to_string(), tags: host_tags.clone(),
+            value: MetricValue::Gauge(self.network.packet_loss_rate),
+            timestamp: ts.clone(), unit: "percent",
+        });
+
+        // ─── Thermal ───
+        for zone in &self.thermal.zones {
+            let mut tags = host_tags.clone();
+            tags.insert("zone".to_string(), zone.name.clone());
+            tags.insert("type".to_string(), zone.zone_type.clone());
             points.push(MetricPoint {
-                name: "net.rx_bytes_per_sec".to_string(),
-                tags: tags.clone(),
-                value: MetricValue::Gauge(iface.rx_bytes_per_sec),
-                timestamp: ts.clone(),
-                unit: "bytes/s",
-            });
-            points.push(MetricPoint {
-                name: "net.tx_bytes_per_sec".to_string(),
-                tags: tags.clone(),
-                value: MetricValue::Gauge(iface.tx_bytes_per_sec),
-                timestamp: ts.clone(),
-                unit: "bytes/s",
+                name: "thermal.temp".to_string(), tags: tags.clone(),
+                value: MetricValue::Gauge(zone.temp_celsius),
+                timestamp: ts.clone(), unit: "celsius",
             });
         }
         points.push(MetricPoint {
-            name: "net.tcp_connections".to_string(),
-            tags: host_tags.clone(),
-            value: MetricValue::Gauge(self.network.tcp_connections as f64),
-            timestamp: ts.clone(),
-            unit: "count",
+            name: "thermal.max_temp".to_string(), tags: host_tags.clone(),
+            value: MetricValue::Gauge(self.thermal.max_temp_celsius),
+            timestamp: ts.clone(), unit: "celsius",
         });
-        points.push(MetricPoint {
-            name: "net.tcp_retransmit_rate".to_string(),
-            tags: host_tags.clone(),
-            value: MetricValue::Gauge(self.network.tcp_retransmit_rate),
-            timestamp: ts.clone(),
-            unit: "percent",
-        });
+
+        // ─── Processes (top N with full data) ───
+        for proc in &self.processes.processes {
+            let mut tags = host_tags.clone();
+            tags.insert("pid".to_string(), proc.pid.to_string());
+            tags.insert("name".to_string(), proc.name.clone());
+            tags.insert("ppid".to_string(), proc.ppid.to_string());
+            tags.insert("state".to_string(), proc.state.clone());
+            if !proc.cgroup.path.is_empty() {
+                tags.insert("cgroup".to_string(), proc.cgroup.path.clone());
+            }
+            points.push(MetricPoint {
+                name: "process.cpu".to_string(), tags: tags.clone(),
+                value: MetricValue::Gauge(proc.cpu_pct),
+                timestamp: ts.clone(), unit: "percent",
+            });
+            points.push(MetricPoint {
+                name: "process.memory".to_string(), tags: tags.clone(),
+                value: MetricValue::Gauge(proc.mem_bytes as f64),
+                timestamp: ts.clone(), unit: "bytes",
+            });
+            points.push(MetricPoint {
+                name: "process.open_fds".to_string(), tags: tags.clone(),
+                value: MetricValue::Gauge(proc.open_fds as f64),
+                timestamp: ts.clone(), unit: "count",
+            });
+            points.push(MetricPoint {
+                name: "process.threads".to_string(), tags: tags.clone(),
+                value: MetricValue::Gauge(proc.threads as f64),
+                timestamp: ts.clone(), unit: "count",
+            });
+            // Cgroup limits
+            if let Some(cpu_lim) = proc.cgroup.cpu_limit_cores {
+                points.push(MetricPoint {
+                    name: "process.cgroup.cpu_limit".to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(cpu_lim),
+                    timestamp: ts.clone(), unit: "cores",
+                });
+            }
+            if let Some(mem_lim) = proc.cgroup.memory_limit_bytes {
+                points.push(MetricPoint {
+                    name: "process.cgroup.memory_limit".to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(mem_lim as f64),
+                    timestamp: ts.clone(), unit: "bytes",
+                });
+            }
+            if let Some(mem_use) = proc.cgroup.memory_usage_bytes {
+                points.push(MetricPoint {
+                    name: "process.cgroup.memory_usage".to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(mem_use as f64),
+                    timestamp: ts.clone(), unit: "bytes",
+                });
+            }
+            if let Some(io_w) = proc.cgroup.io_weight {
+                points.push(MetricPoint {
+                    name: "process.cgroup.io_weight".to_string(), tags: tags.clone(),
+                    value: MetricValue::Gauge(io_w as f64),
+                    timestamp: ts.clone(), unit: "weight",
+                });
+            }
+            if !proc.children.is_empty() {
+                let children_str = proc.children.iter()
+                    .map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+                let mut ctags = tags.clone();
+                ctags.insert("children".to_string(), children_str);
+                points.push(MetricPoint {
+                    name: "process.children_count".to_string(), tags: ctags,
+                    value: MetricValue::Gauge(proc.children.len() as f64),
+                    timestamp: ts.clone(), unit: "count",
+                });
+            }
+        }
 
         points
     }

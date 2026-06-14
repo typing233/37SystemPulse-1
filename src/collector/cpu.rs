@@ -1,7 +1,8 @@
 use crate::collector::CollectorError;
 use crate::metrics::{CoreMetrics, CpuMetrics};
-use std::fs;
-use std::io::Read;
+
+#[cfg(target_os = "linux")]
+use crate::platform::linux::syscall;
 
 pub struct CpuCollector {
     prev_stats: Option<Vec<CpuRawStat>>,
@@ -36,42 +37,74 @@ impl CpuCollector {
 
     #[cfg(target_os = "linux")]
     fn read_stat(&self) -> Result<Vec<CpuRawStat>, CollectorError> {
-        let mut buf = String::with_capacity(4096);
-        let mut file = fs::File::open("/proc/stat")?;
-        file.read_to_string(&mut buf)?;
-
-        let mut stats = Vec::new();
-        for line in buf.lines() {
-            if !line.starts_with("cpu") {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 8 {
-                continue;
-            }
-            let parse = |i: usize| -> u64 { parts[i].parse().unwrap_or(0) };
-            stats.push(CpuRawStat {
-                user: parse(1),
-                nice: parse(2),
-                system: parse(3),
-                idle: parse(4),
-                iowait: if parts.len() > 5 { parse(5) } else { 0 },
-                irq: if parts.len() > 6 { parse(6) } else { 0 },
-                softirq: if parts.len() > 7 { parse(7) } else { 0 },
-                steal: if parts.len() > 8 { parse(8) } else { 0 },
-            });
+        let mut buf = [0u8; 8192];
+        let n = syscall::read_file_to_buf(b"/proc/stat\0", &mut buf);
+        if n <= 0 {
+            return Err(CollectorError::Io(std::io::Error::from_raw_os_error(-n as i32)));
         }
-        if stats.is_empty() {
-            return Err(CollectorError::Parse("no CPU stats found".to_string()));
-        }
-        Ok(stats)
+        let data = &buf[..n as usize];
+        self.parse_stat_bytes(data)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn read_stat(&self) -> Result<Vec<CpuRawStat>, CollectorError> {
-        Err(CollectorError::Unsupported(
-            "CPU collection not implemented for this platform".to_string(),
-        ))
+        Err(CollectorError::Unsupported("CPU: not linux".into()))
+    }
+
+    fn parse_stat_bytes(&self, data: &[u8]) -> Result<Vec<CpuRawStat>, CollectorError> {
+        let mut stats = Vec::with_capacity(16);
+        let mut pos = 0;
+        while pos < data.len() {
+            // Find line start
+            if pos + 3 >= data.len() || data[pos] != b'c' || data[pos + 1] != b'p' || data[pos + 2] != b'u' {
+                // skip to next line
+                while pos < data.len() && data[pos] != b'\n' {
+                    pos += 1;
+                }
+                pos += 1;
+                continue;
+            }
+            // skip "cpu" or "cpuN" prefix
+            pos += 3;
+            while pos < data.len() && data[pos] != b' ' && data[pos] != b'\n' {
+                pos += 1;
+            }
+            // Parse 8+ fields
+            let mut fields = [0u64; 10];
+            for f in &mut fields {
+                // skip whitespace
+                while pos < data.len() && data[pos] == b' ' {
+                    pos += 1;
+                }
+                if pos >= data.len() || data[pos] == b'\n' {
+                    break;
+                }
+                let start = pos;
+                while pos < data.len() && data[pos] >= b'0' && data[pos] <= b'9' {
+                    pos += 1;
+                }
+                *f = crate::platform::linux::parse_u64_from_bytes(&data[start..pos]);
+            }
+            stats.push(CpuRawStat {
+                user: fields[0],
+                nice: fields[1],
+                system: fields[2],
+                idle: fields[3],
+                iowait: fields[4],
+                irq: fields[5],
+                softirq: fields[6],
+                steal: fields[7],
+            });
+            // skip to next line
+            while pos < data.len() && data[pos] != b'\n' {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if stats.is_empty() {
+            return Err(CollectorError::Parse("no cpu stats".into()));
+        }
+        Ok(stats)
     }
 
     fn compute_delta(&self, prev: &[CpuRawStat], current: &[CpuRawStat]) -> CpuMetrics {
@@ -83,14 +116,8 @@ impl CpuCollector {
             self.stat_to_pct(&prev[0], &current[0], 0)
         } else {
             CoreMetrics {
-                core_id: 0,
-                user_pct: 0.0,
-                system_pct: 0.0,
-                softirq_pct: 0.0,
-                hardirq_pct: 0.0,
-                idle_pct: 100.0,
-                iowait_pct: 0.0,
-                steal_pct: 0.0,
+                core_id: 0, user_pct: 0.0, system_pct: 0.0, softirq_pct: 0.0,
+                hardirq_pct: 0.0, idle_pct: 100.0, iowait_pct: 0.0, steal_pct: 0.0,
             }
         };
         CpuMetrics { per_core, total }
@@ -107,14 +134,8 @@ impl CpuCollector {
         let total = d_user + d_sys + d_idle + d_iowait + d_irq + d_softirq + d_steal;
         if total == 0 {
             return CoreMetrics {
-                core_id,
-                user_pct: 0.0,
-                system_pct: 0.0,
-                softirq_pct: 0.0,
-                hardirq_pct: 0.0,
-                idle_pct: 100.0,
-                iowait_pct: 0.0,
-                steal_pct: 0.0,
+                core_id, user_pct: 0.0, system_pct: 0.0, softirq_pct: 0.0,
+                hardirq_pct: 0.0, idle_pct: 100.0, iowait_pct: 0.0, steal_pct: 0.0,
             };
         }
         let pct = |v: u64| -> f64 { (v as f64 / total as f64) * 100.0 };
@@ -132,20 +153,11 @@ impl CpuCollector {
 
     fn zero_metrics(&self, count: usize) -> CpuMetrics {
         let zero_core = |id: u32| CoreMetrics {
-            core_id: id,
-            user_pct: 0.0,
-            system_pct: 0.0,
-            softirq_pct: 0.0,
-            hardirq_pct: 0.0,
-            idle_pct: 100.0,
-            iowait_pct: 0.0,
-            steal_pct: 0.0,
+            core_id: id, user_pct: 0.0, system_pct: 0.0, softirq_pct: 0.0,
+            hardirq_pct: 0.0, idle_pct: 100.0, iowait_pct: 0.0, steal_pct: 0.0,
         };
-        let per_core = (0..count.saturating_sub(1))
-            .map(|i| zero_core(i as u32))
-            .collect();
         CpuMetrics {
-            per_core,
+            per_core: (0..count.saturating_sub(1)).map(|i| zero_core(i as u32)).collect(),
             total: zero_core(0),
         }
     }
